@@ -1,4 +1,4 @@
-import os
+import os, sys
 import glob
 import numpy as np
 import pandas as pd
@@ -13,8 +13,8 @@ import json
 # CONFIG
 # ============================================================
 
-PLY_DIR = "data/point_cloud/test"
-MODEL_PATH = "models/qoe_model_xgb_v2.0.pkl"
+PLY_DIR = "data/point_cloud"
+MODEL_PATH = "models/qoe_model_xgb_v3.0.pkl"
 OUTPUT_CSV = "data/pc_projection_qoe.csv"
 
 # Subsampling target point budgets
@@ -24,11 +24,10 @@ POINT_BUDGETS = [5000, 10000, 20000, 40000, 80000]
 IMG_W, IMG_H = 512, 512
 POINT_SIZE = 3
 
-# Fixed camera views: (center, eye, up)
 def get_camera_pose(center, D, view):
-    if view == "front":
-        return center + np.array([0, +D, 0]), center, np.array([0, 0, 1])
     if view == "back":
+        return center + np.array([0, +D, 0]), center, np.array([0, 0, 1])
+    if view == "front":
         return center + np.array([0, -D, 0]), center, np.array([0, 0, 1])
     if view == "right":
         return center + np.array([+D, 0, 0]), center, np.array([0, 0, 1])
@@ -39,7 +38,7 @@ def get_camera_pose(center, D, view):
     if view == "bottom":
         return center + np.array([0, 0, +D]), center, np.array([0, 1, 0])
 
-VIEWS = ["front", "back", "right", "left", "top", "bottom"]
+VIEWS = ["front", "right", "left", "top", "bottom"]
 
 # ============================================================
 # LOAD MODEL
@@ -48,7 +47,6 @@ VIEWS = ["front", "back", "right", "left", "top", "bottom"]
 print(f"Loading QoE model from {MODEL_PATH} ...")
 model = joblib.load(MODEL_PATH)
 
-# The feature order must match your training script
 FEATURE_COLS = [
     "vmaf",
     "psnr",
@@ -108,7 +106,7 @@ def render_all_views(pcd):
     return imgs
 
 # ============================================================
-# METRICS: SSIM, PSNR, VMAF, SI, TI
+# METRICS
 # ============================================================
 
 def rgb_to_y(img):
@@ -127,6 +125,9 @@ def ssim_psnr_multi(ref_imgs, dist_imgs):
 
 def vmaf_one_view(ref_img, dist_img):
     """Compute VMAF for a single image pair via ffmpeg/libvmaf. Returns NaN if fails."""
+
+    from ffmpeg_quality_metrics import FfmpegQualityMetrics
+
     try:
         with tempfile.TemporaryDirectory() as tmp:
             ref_path = os.path.join(tmp, "ref.png")
@@ -136,21 +137,10 @@ def vmaf_one_view(ref_img, dist_img):
             cv2.imwrite(ref_path, cv2.cvtColor(ref_img, cv2.COLOR_RGB2BGR))
             cv2.imwrite(dist_path, cv2.cvtColor(dist_img, cv2.COLOR_RGB2BGR))
 
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", ref_path,
-                "-i", dist_path,
-                "-lavfi",
-                f"[0:v]scale={IMG_W}:{IMG_H},format=yuv420p[ref];"
-                f"[1:v]scale={IMG_W}:{IMG_H},format=yuv420p[dist];"
-                f"[ref][dist]libvmaf=log_path={json_path}:log_fmt=json",
-                "-f", "null", "-"
-            ]
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            ffqm = FfmpegQualityMetrics(ref_path, dist_path)
+            metrics = ffqm.calculate(["vmaf"])
 
-            with open(json_path, "r") as f:
-                data = json.load(f)
-            return float(data["frames"][0]["metrics"]["vmaf"])
+            return metrics["vmaf"][0]["vmaf"]
     except Exception as e:
         print("VMAF computation failed, returning NaN:", e)
         return np.nan
@@ -210,125 +200,119 @@ def subsample_points(pcd, target_points):
 # ============================================================
 
 def main():
-    frame_paths = sorted(glob.glob(os.path.join(PLY_DIR, "*.ply")))
-    if not frame_paths:
-        print(f"No .ply files found in {PLY_DIR}")
-        return
-
-    print(f"Found {len(frame_paths)} point-cloud frames.")
-
-    if not True:  # turn off when done testing
-        path = frame_paths[0]
-        pcd = o3d.io.read_point_cloud(path)
-        # imgs = render_all_views(pcd)
-
-        import matplotlib.pyplot as plt
-
-        for target_pts in [5000, 20000, 80000]:
-            pcd_sub, _ = subsample_points(pcd, target_pts)
-            imgs = render_all_views(pcd_sub)
-
-            plt.figure(figsize=(10, 6))
-            for i, img in enumerate(imgs):
-                plt.subplot(2, 3, i+1)
-                plt.imshow(img)
-                plt.title(f"{VIEWS[i]} ({target_pts} pts)")
-                plt.axis("off")
-            plt.tight_layout()
-            plt.show()
-        
-        return  # stop here
-
-    # First pass: get max point count to define bitrate proxy scale
-    max_points = 0
-    frame_point_counts = []
-    for path in frame_paths:
-        pcd = o3d.io.read_point_cloud(path)
-        n_points = len(pcd.points)
-        frame_point_counts.append(n_points)
-        max_points = max(max_points, n_points)
-
-    if max_points == 0:
-        print("All frames have zero points; aborting.")
-        return
-
-    print(f"Max points in any frame: {max_points}")
-
-    # Second pass: projection + QoE prediction
     results = []
 
-    # Precompute reference projections for SI/TI
-    print("Rendering reference projections for SI/TI ...")
-    ref_view_seq = []
-    for path in frame_paths:
-        pcd = o3d.io.read_point_cloud(path)
-        ref_views = render_all_views(pcd)
-        ref_view_seq.append(ref_views[0])  # use first view for SI/TI
+    subjects = sorted(os.listdir(PLY_DIR))
+    subjects = [s for s in subjects if os.path.isdir(os.path.join(PLY_DIR, s))]
 
-    si_list, ti_list = spatial_temporal_info(ref_view_seq)
+    print("Foud subjects: ", subjects)
 
-    print("Processing frames for QoE predictions ...")
-    for idx, path in enumerate(frame_paths):
-        frame_name = os.path.basename(path)
-        print(f"\nFrame {idx+1}/{len(frame_paths)}: {frame_name}")
+    for subject in subjects:
+        subject_dir = os.path.join(PLY_DIR, subject) + "/ply"
 
-        full_pcd = o3d.io.read_point_cloud(path)
-        full_views = render_all_views(full_pcd)
+        frame_paths = sorted(glob.glob(os.path.join(subject_dir, "*.ply")))
 
-        # Use SI/TI from first-view sequence
-        spatial_info = si_list[idx]
-        temporal_info = ti_list[idx]
+        if not frame_paths:
+            print(f"No .ply files found in {subject_dir}")
+            continue
 
-        # Iterate over subsampling budgets
-        for target_pts in POINT_BUDGETS:
-            print(f"  Subsampling to ~{target_pts} points ...")
-            pcd_sub, actual_pts = subsample_points(full_pcd, target_pts)
-            dist_views = render_all_views(pcd_sub)
+        print(f"\n=== Processing subject: {subject} ({len(frame_paths)} frames) ===")
 
-            # Compute 2D metrics
-            ssim_val, psnr_val = ssim_psnr_multi(full_views, dist_views)
-            # vmaf_val = vmaf_multi(full_views, dist_views)
+        if subject.endswith("10"):
+            IMG_H = IMG_W = 1024
+        else:
+            IMG_H = IMG_W = 512
 
-            vmaf_val = 40.0
-            # psnr_val = 32.0
-            # ssim_val = 0.9
+        # First pass: get max point count to define bitrate proxy scale
+        max_points = 0
+        frame_point_counts = []
+        for path in frame_paths:
+            pcd = o3d.io.read_point_cloud(path)
+            n_points = len(pcd.points)
+            frame_point_counts.append(n_points)
+            max_points = max(max_points, n_points)
 
-            # Bitrate proxy: scale points to ~[0, 3000] kbps range
-            bitrate_proxy = (actual_pts / max_points) * 3000.0
+        if max_points == 0:
+            print("All frames have zero points; aborting.")
+            return
 
-            # No stalls in this offline experiment
-            is_rebuffered = 0.0
+        print(f"Max points in any frame: {max_points}")
 
-            # STRRED is not computed for projections; set NaN
-            strred_val = np.nan
+        # Second pass: projection + QoE prediction
 
-            # Build features in the exact training order
-            feat_vec = np.array([[
-                vmaf_val,
-                psnr_val,
-                ssim_val,
-                strred_val,
-                bitrate_proxy,
-                is_rebuffered,
-                spatial_info,
-                temporal_info,
-            ]], dtype=float)
+        # Precompute reference projections for SI/TI
+        print("Rendering reference projections for SI/TI ...")
+        ref_view_seq = []
+        for path in frame_paths:
+            pcd = o3d.io.read_point_cloud(path)
+            ref_views = render_all_views(pcd)
+            ref_view_seq.append(ref_views[0])  # use first view for SI/TI
 
-            qoe_pred = float(model.predict(feat_vec)[0])
+        si_list, ti_list = spatial_temporal_info(ref_view_seq)
 
-            results.append({
-                "frame_idx": idx,
-                "frame_name": frame_name,
-                "target_points": target_pts,
-                "actual_points": actual_pts,
-                "vmaf_proj": vmaf_val,
-                "psnr_proj": psnr_val,
-                "ssim_proj": ssim_val,
-                "bitrate_proxy": bitrate_proxy,
-                "spatial_info_proj": spatial_info,
-                "temporal_info_proj": temporal_info,
-                "qoe_pred": qoe_pred,
-            })
+        print("Processing frames for QoE predictions ...")
+        for idx, path in enumerate(frame_paths):
+            frame_name = os.path.basename(path)
+            print(f"\nFrame {idx+1}/{len(frame_paths)}: {frame_name}")
+
+            full_pcd = o3d.io.read_point_cloud(path)
+            full_views = render_all_views(full_pcd)
+
+            # Use SI/TI from first-view sequence
+            spatial_info = si_list[idx]
+            temporal_info = ti_list[idx]
+
+            # Iterate over subsampling budgets
+            for target_pts in POINT_BUDGETS:
+                print(f"  Subsampling to ~{target_pts} points ...")
+                pcd_sub, actual_pts = subsample_points(full_pcd, target_pts)
+                dist_views = render_all_views(pcd_sub)
+
+                # Compute 2D metrics
+                ssim_val, psnr_val = ssim_psnr_multi(full_views, dist_views)
+                vmaf_val = vmaf_multi(full_views, dist_views)
+
+                # vmaf_val = 40.0
+
+                # vmaf_val = 40.0
+                # psnr_val = 32.0
+                # ssim_val = 0.9
+
+                # Bitrate proxy: scale points to ~[0, 3000] kbps range
+                bitrate_proxy = (actual_pts / max_points) * 3000.0
+
+                # No stalls in this offline experiment
+                is_rebuffered = 0.0
+
+                # STRRED is not computed for projections; set NaN
+                # strred_val = np.nan
+
+                # Build features in the exact training order
+                feat_vec = np.array([[
+                    vmaf_val,
+                    psnr_val,
+                    ssim_val,
+                    bitrate_proxy,
+                    is_rebuffered,
+                ]], dtype=float)
+
+                qoe_pred = float(model.predict(feat_vec)[0])
+
+                results.append({
+                    "subject": subject,
+                    "frame_idx": idx,
+                    "frame_name": frame_name,
+                    "proj_resolution": f'{IMG_H}x{IMG_W}',
+                    "target_points": target_pts,
+                    "actual_points": actual_pts,
+                    "vmaf_proj": vmaf_val,
+                    "psnr_proj": psnr_val,
+                    "ssim_proj": ssim_val,
+                    "bitrate_proxy": bitrate_proxy,
+                    # "spatial_info_proj": spatial_info,
+                    # "temporal_info_proj": temporal_info,
+                    "qoe_prediction": qoe_pred,
+                })
 
     df = pd.DataFrame(results)
     os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
